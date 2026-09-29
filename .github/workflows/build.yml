@@ -1,0 +1,154 @@
+# Build Plunk (upstream tag in UPSTREAM_VERSION) with the Uxdata branding applied,
+# push it to GHCR and optionally deploy it to the uxdata VPS.
+#
+#   Image: ghcr.io/julio-daza/plunk-uxdata:<upstream-version>-uxdata.<BRAND_REVISION>
+#          (+ :sha-<commit>; :latest only moves on a deploying run)
+#
+# Push to main   → build + push (no deploy).
+# Manual run     → `gh workflow run build.yml -f deploy=true` builds if needed and
+#                  deploys through the uxdata-infra forced command (`deploy plunk <tag>`).
+#                  The compose service `plunk` in uxdata-infra MUST already pin this
+#                  exact tag (the VPS wrapper retags the pulled image as the compose image).
+#
+# The build is self-contained (not the reusable uxdata-infra workflow) because the
+# Docker context is an upstream checkout patched by patch/apply.sh, not this repo.
+# The deploy step reuses the same forced-command pattern and secrets.
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the uxdata VPS after building
+        type: boolean
+        default: false
+
+concurrency:
+  group: plunk-uxdata-build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/julio-daza/plunk-uxdata
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: meta
+        run: |
+          upstream="$(tr -d '[:space:]' < UPSTREAM_VERSION)"
+          rev="$(tr -d '[:space:]' < BRAND_REVISION)"
+          [[ "$upstream" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad UPSTREAM_VERSION: $upstream"; exit 1; }
+          [[ "$rev" =~ ^[0-9]+$ ]] || { echo "bad BRAND_REVISION: $rev"; exit 1; }
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "tag=${upstream#v}-uxdata.$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A version tag is immutable: if it exists and was built from another commit,
+      # BRAND_REVISION (or UPSTREAM_VERSION) must be bumped. Same commit → skip the build.
+      - id: exists
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if json=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{ json .Image }}' 2>/dev/null); then
+            rev=$(jq -r '(if has("config") then . else .["linux/amd64"] end).config.Labels["org.opencontainers.image.revision"] // ""' <<<"$json")
+            if [ "$rev" = "$GITHUB_SHA" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"; echo "$IMAGE:$TAG already built from this commit"
+            else
+              echo "::error::$IMAGE:$TAG already exists (built from ${rev:-unknown}). Bump BRAND_REVISION."; exit 1
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream Plunk
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: useplunk/plunk
+          ref: ${{ steps.meta.outputs.upstream }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Apply Uxdata branding
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          git -C upstream fetch --depth 1 origin "refs/tags/${{ steps.meta.outputs.upstream }}:refs/tags/${{ steps.meta.outputs.upstream }}"
+          patch/apply.sh upstream
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.exists.outputs.skip != 'true'
+
+      - uses: docker/build-push-action@v7
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.title=Plunk (Uxdata branding)
+            org.opencontainers.image.description=useplunk/plunk ${{ steps.meta.outputs.upstream }} with Uxdata branding. Source: https://github.com/${{ github.repository }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.upstream }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=plunk-uxdata
+          cache-to: type=gha,mode=max,scope=plunk-uxdata
+
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: uxdata-deploy-plunk
+      cancel-in-progress: false
+    steps:
+      - name: Move latest to the deployed tag
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$TAG"
+
+      - name: Deploy over SSH (forced command)
+        env:
+          DEPLOY_KEY: ${{ secrets.UXDATA_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.UXDATA_KNOWN_HOSTS }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOST: 2.25.251.104
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/uxdata_deploy && chmod 600 ~/.ssh/uxdata_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/uxdata_deploy -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 \
+            "deploy@$HOST" "deploy plunk $TAG"
