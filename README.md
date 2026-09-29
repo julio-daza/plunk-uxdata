@@ -37,8 +37,8 @@ the docs wiki, and texts only reachable with Stripe billing on (off when self-ho
 
 - Every replacement names the exact string it expects; if upstream moved it, `apply.sh`
   fails and prints the missing anchor.
-- After replacing, a guard scans `apps/web/src`, `apps/web/public` and
-  `packages/email/src` for any "Plunk" left in a non-comment line. Anything not listed in
+- After replacing, a guard scans `apps/web/src`, `apps/web/public`,
+  `packages/email/src` and `packages/ui/src` for any "Plunk" left in a non-comment line. Anything not listed in
   `ALLOWED_LEFTOVERS` fails the build — a new upstream string is caught, not shipped.
 - `apply.sh` refuses a checkout whose tag differs from `UPSTREAM_VERSION`, and a missing
   upstream asset.

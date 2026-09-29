@@ -34,7 +34,8 @@ const REPLACEMENTS = [
   [`${W}/src/pages/_document.tsx`, 'color="#5bbad5"', 'color="#000000"', 1],
   [`${W}/public/favicon/site.webmanifest`, '"Plunk"', `"${NAME}"`, 2],
 
-  // Logo + name in the dashboard chrome and the auth/onboarding screens
+  // Logo + name in the dashboard chrome, the full-screen loader and the auth/onboarding screens
+  ['packages/ui/src/components/atoms/Loader.tsx', 'alt="Plunk"', `alt="${NAME}"`, 1],
   [`${W}/src/components/DashboardLayout.tsx`, 'alt="Plunk"', `alt="${NAME}"`, 2],
   [`${W}/src/components/DashboardLayout.tsx`, 'text-neutral-900">Plunk</h1>', `text-neutral-900">${NAME}</h1>`, 2],
   [`${W}/src/components/onboarding/OnboardingLayout.tsx`, 'text-neutral-900">Plunk</span>', `text-neutral-900">${NAME}</span>`, 1],
@@ -97,7 +98,7 @@ const ALLOWED_LEFTOVERS = [
 ];
 
 // Where the guard looks: everything a dashboard user or an email recipient can see.
-const GUARD_DIRS = [`${W}/src`, `${W}/public`, 'packages/email/src'];
+const GUARD_DIRS = [`${W}/src`, `${W}/public`, 'packages/email/src', 'packages/ui/src'];
 
 const failures = [];
 let applied = 0;
